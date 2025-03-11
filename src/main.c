@@ -1,11 +1,13 @@
 /*
- * Copyright (c) 2018 Nordic Semiconductor ASA
- *
+ * Copyright (c) 2024 Nordic Semiconductor ASA
  * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
  */
 
 /** @file
- *  @brief Nordic UART Bridge Service (NUS) sample
+ *  @brief Nordic UART Bridge Service (NUS) CTRL sample
+ * 	auth: ddhd + nod
+ * 	lets you control some BT functionality and an LED 
+ *  with a packet type called PUC.
  */
 #include <uart_async_adapter.h>
 
@@ -34,7 +36,7 @@
 
 #include <zephyr/logging/log.h>
 
-#define LOG_MODULE_NAME peripheral_uart
+#define LOG_MODULE_NAME puc
 LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 
 #define STACKSIZE CONFIG_BT_NUS_THREAD_STACK_SIZE
@@ -61,9 +63,9 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 #define PUC_LED_OFF 4
 #define PUC_DATA 5
 
-#define MAX_PUCTRL_MSG_LEN 16 // arbitrary, just an example.
+#define MAX_PUCTRL_MSG_LEN 4 // arbitrary, just an example.
 #define PUCTRL_PREAM_LEN 3
-#define MAX_PUCTRL_LEN PUCTRL_PREAM_LEN + MAX_PUCTRL_MSG_LEN + 3 // [3, pream][1, cmd][1, len][16, msg][1, crc]
+#define MAX_PUCTRL_LEN PUCTRL_PREAM_LEN + MAX_PUCTRL_MSG_LEN + 3 // [3, pream][1, cmd][1, len][len, msg][1, crc], +3 for cmdlencrc
 #define PUC_CRC_IDX MAX_PUCTRL_LEN - 1
 static const uint8_t puc_pre[PUCTRL_PREAM_LEN] = {'P', 'U', 'C'};
 
@@ -74,6 +76,8 @@ static struct bt_conn *auth_conn;
 
 static const struct device *uart = DEVICE_DT_GET(DT_CHOSEN(nordic_nus_uart));
 static struct k_work_delayable uart_work;
+
+volatile bool ble_adv = false;
 
 struct uart_data_t
 {
@@ -113,21 +117,25 @@ static const struct bt_data sd[] = {
 	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_VAL),
 };
 
-static int check_puctrl(uint8_t *msg)
+static int check_puctrl(uint8_t *msg, int len)
 {
-	return memcmp(msg, puc_pre, 3);
+	int ret;
+	ret = (len >= 3) ? memcmp(msg, puc_pre, 3) : -1;
+	return ret;
 }
 
-static bool puc_crc(uint8_t *buf, uint8_t len)
+static bool puc_crc(puctrl_t puc, size_t len)
 {
-	bool ret;
+	bool ret = false;
 	int xorc = 0;
+	uint8_t buf[sizeof(puctrl_t)];
+	memcpy(buf, &puc, sizeof(puctrl_t));
 	for (int i = 0; i < MAX_PUCTRL_LEN - 1; i++)
 	{
 		xorc ^= buf[i];
 	}
-	return ret = (xorc == buf[PUC_CRC_IDX]) ? true : false;
-	;
+	LOG_DBG("calc crc: %x, puc_crc: %x", xorc, puc.crc);
+	return ret = (xorc == puc.crc) ? true : false;
 }
 
 void puctrl_work_handler(struct k_work *work)
@@ -135,13 +143,16 @@ void puctrl_work_handler(struct k_work *work)
 	int err;
 	struct puctrl_work_container *container = CONTAINER_OF(work, struct puctrl_work_container, puc_work);
 	//! print PUC pass for debugging
-	LOG_INF("PRE: %s", container->puctrl.pre);
-	LOG_INF("CMD: %x", container->puctrl.cmd);
-	LOG_INF("LEN: %d", container->puctrl.len);
-	LOG_INF("MSG: %s", container->puctrl.msg);
-	LOG_INF("CRC: %x", container->puctrl.crc);
+	LOG_DBG("PRE: %x %x %x", container->puctrl.pre[0], container->puctrl.pre[1], container->puctrl.pre[2]);
+	LOG_DBG("CMD: %x", container->puctrl.cmd);
+	LOG_DBG("LEN: %d", container->puctrl.len);
+	for (int i = 0; i < container->puctrl.len; i++)
+	{
+		LOG_DBG("MSG[%d]: %d", i, container->puctrl.msg[i]);
+	}
+	LOG_DBG("CRC: %x", container->puctrl.crc);
 
-	if (!puc_crc(container->puctrl.msg, container->puctrl.len))
+	if (!puc_crc(container->puctrl, container->puctrl.len))
 	{
 		LOG_ERR("PUC preamble detected, but CRC failed");
 		return;
@@ -151,26 +162,54 @@ void puctrl_work_handler(struct k_work *work)
 	{
 	// NOTE: For LE commands you should check
 	// if there is active connection context, if adv already started, etc...
+	// just a few examples illustrated here
 	case PUC_BLE_ON:
-		err = bt_le_adv_start(BT_LE_ADV_CONN, ad, ARRAY_SIZE(ad), sd,
-							  ARRAY_SIZE(sd));
-		if (err)
+		if (ble_adv || current_conn != NULL)
 		{
-			LOG_ERR("couldnt start advertising.");
+			LOG_ERR("ble already active");
 		}
+		else
+		{
+			err = bt_le_adv_start(BT_LE_ADV_CONN, ad, ARRAY_SIZE(ad), sd,
+								  ARRAY_SIZE(sd));
+			if (err)
+			{
+				LOG_ERR("couldnt start advertising.");
+			}
+		}
+		LOG_INF("adv started");
+		ble_adv = true;
 		break;
 	case PUC_BLE_OFF:
-		err = bt_le_adv_stop();
-		if (err)
+		if (ble_adv)
 		{
-			LOG_ERR("couldnt start advertising.");
+			if (current_conn != NULL)
+			{
+				int err = bt_conn_disconnect(current_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+				if (err)
+				{
+					LOG_ERR("bt_conn_disconnect failed (err %d)\n", err);
+				}
+			}
+			else
+			{
+				err = bt_le_adv_stop();
+				if (err)
+				{
+					LOG_ERR("couldnt stop advertising.");
+				}
+				LOG_INF("adv stopped");
+			}
+			ble_adv = false;
 		}
 		break;
 	case PUC_LED_ON:
 		dk_set_led_on(DK_LED4);
+		LOG_INF("LED4 on");
 		break;
 	case PUC_LED_OFF:
 		dk_set_led_off(DK_LED4);
+		LOG_INF("LED4 off");
 		break;
 	case PUC_DATA:
 		break;
@@ -243,24 +282,22 @@ static void uart_cb(const struct device *dev, struct uart_event *evt, void *user
 			return;
 		}
 
-		if ((evt->data.rx.buf[buf->len - 1] == '\n') ||
-			(evt->data.rx.buf[buf->len - 1] == '\r'))
+		// check for puctrl preamble
+		if (evt->data.rx.len >= 3)
 		{
-			disable_req = true;
-			uart_rx_disable(uart);
-			// check for puctrl byte
-			memcpy(puctrl_work.puctrl.pre, buf, 3); // check first byte for puc
-			int puctrl_check = check_puctrl(puctrl_work.puctrl.pre);
-			if (puctrl_check != 0) // nonzero is a puctrl preamble
+			memcpy(puctrl_work.puctrl.pre, evt->data.rx.buf, 3);
+			int puctrl_check = check_puctrl(puctrl_work.puctrl.pre, 3);
+			if (puctrl_check == 0)
 			{
 				if (k_work_busy_get(&puctrl_work.puc_work) == 0)
 				{
+					memcpy(puctrl_work.puctrl.pre, evt->data.rx.buf, 3);
 					puctrl_work.puctrl.cmd = puctrl_check;
-					(buf->len > MAX_PUCTRL_LEN) ? (puctrl_work.puctrl.err = 1) : (puctrl_work.puctrl.err = 0);
+					(evt->data.rx.len > MAX_PUCTRL_LEN) ? (puctrl_work.puctrl.err = 1) : (puctrl_work.puctrl.err = 0);
 					if (!puctrl_work.puctrl.err)
 					{
 						// copy over msg
-						memcpy(&puctrl_work.puctrl, buf, MAX_PUCTRL_LEN);
+						memcpy(&puctrl_work.puctrl, evt->data.rx.buf, MAX_PUCTRL_LEN);
 						k_work_submit(&puctrl_work.puc_work);
 					}
 					else
@@ -273,7 +310,15 @@ static void uart_cb(const struct device *dev, struct uart_event *evt, void *user
 					// The work item is busy, handle this case appropriately
 					// (e.g., wait and retry, or use a different synchronization method)
 				}
+				disable_req = true;
+				uart_rx_disable(uart);
 			}
+		}
+		else if ((evt->data.rx.buf[buf->len - 1] == '\n') ||
+				 (evt->data.rx.buf[buf->len - 1] == '\r'))
+		{
+			disable_req = true;
+			uart_rx_disable(uart);
 		}
 
 		break;
@@ -321,7 +366,11 @@ static void uart_cb(const struct device *dev, struct uart_event *evt, void *user
 
 		if (buf->len > 0)
 		{
-			k_fifo_put(&fifo_uart_rx_data, buf);
+			if (check_puctrl(evt->data.rx.buf, 3) != 0)
+			{ // only transmit over LE if it's not puc
+				LOG_INF("PUTTING INTO FIFO");
+				k_fifo_put(&fifo_uart_rx_data, buf);
+			}
 		}
 		else
 		{
@@ -460,7 +509,7 @@ static int uart_init(void)
 	if (tx)
 	{
 		pos = snprintf(tx->data, sizeof(tx->data),
-					   "Starting Nordic UART service example\r\n");
+					   "Starting Nordic Peripheral UART CTRL service example\r\n");
 
 		if ((pos < 0) || (pos >= sizeof(tx->data)))
 		{
@@ -826,6 +875,7 @@ int main(void)
 		LOG_ERR("Advertising failed to start (err %d)", err);
 		return 0;
 	}
+	ble_adv = true;
 
 	for (;;)
 	{
