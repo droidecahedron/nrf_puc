@@ -81,7 +81,7 @@ static int gen_xorc(uint8_t *buf, uint16_t len)
     int xorc = 0;
     for (int i = 0; i < len; i++)
 		xorc ^= buf[i];
-	return xorc;
+    return xorc;
 }
 ```
 
