@@ -2,7 +2,7 @@
 
 This example is based on the [Peripheral UART Sample](https://docs.nordicsemi.com/bundle/ncs-2.9.0/page/nrf/samples/bluetooth/peripheral_uart/README.html), but using a packet type called PUC as an arbiter to determine if you want the message to be bridged between the UART peripheral and the BLE service, or if you want to do something on the device itself.
 
-This is an rudimentary example illustrating using work queues (as well as transferring data using work containers) adding some system control with a simple protocol.
+This is a rudimentary example illustrating using work queues (as well as transferring data using work containers) adding some system control with a simple protocol.
 
 ![image](https://github.com/user-attachments/assets/1b7915b0-2443-4717-8383-b4164fa0a200)
 
